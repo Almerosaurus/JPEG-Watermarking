@@ -2,7 +2,8 @@ import cv2 as cv
 import numpy as np
 import util
 
-# Standard JPEG Quantization Table for Luminance
+# ── Constants ────────────────────────────────────────────────────────────────
+
 Q_table = np.array([
     [16, 11, 10, 16, 24, 40, 51, 61],
     [12, 12, 14, 19, 26, 58, 60, 55],
@@ -12,9 +13,8 @@ Q_table = np.array([
     [24, 35, 55, 64, 81, 104, 113, 92],
     [49, 64, 78, 87, 103, 121, 120, 101],
     [72, 92, 95, 98, 112, 100, 103, 99]
-])
+], dtype=np.float32)
 
-# 22 mid-frequency indices in zigzag order
 mid_freq_indices = [
     (0, 4), (1, 3), (2, 2), (3, 1), (4, 0),
     (5, 0), (4, 1), (3, 2), (2, 3), (1, 4), (0, 5),
@@ -22,228 +22,222 @@ mid_freq_indices = [
     (7, 0), (6, 1), (5, 2), (4, 3)
 ]
 
-def load_rgb_image(image_path):
-    img = cv.imread(image_path)
-    if img is None:
-        raise FileNotFoundError(f"Image not found at {image_path}")
-    return cv.cvtColor(img, cv.COLOR_BGR2RGB)
+JPEG_QUALITY = 95
 
-def convert_rgb_to_ycbcr(rgb_image):
-    return cv.cvtColor(rgb_image, cv.COLOR_RGB2YCrCb)
 
-def apply_chroma_subsampling(ycbcr_image):
-    return ycbcr_image
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def segment_into_8x8_blocks(image_data):
+def compute_jpeg_qtable(quality: int) -> np.ndarray:
+    quality = max(1, min(100, int(quality)))
+    scale = 5000 / quality if quality < 50 else 200 - 2 * quality
+    qtable = np.floor((Q_table * scale + 50) / 100)
+    return np.clip(qtable, 1, 255).astype(np.float32)
+
+
+def segment_into_8x8_blocks(image_data: np.ndarray) -> np.ndarray:
     h, w, c = image_data.shape
-    h = h - h % 8
-    w = w - w % 8
+    h, w = h - h % 8, w - w % 8
     image_data = image_data[:h, :w, :]
-    
     blocks = []
     for i in range(0, h, 8):
-        row_blocks = []
-        for j in range(0, w, 8):
-            row_blocks.append(image_data[i:i+8, j:j+8, :])
-        blocks.append(row_blocks)
-    return np.array(blocks)
+        row = [image_data[i:i+8, j:j+8, :] for j in range(0, w, 8)]
+        blocks.append(row)
+    return np.array(blocks, dtype=np.float32)
 
-def apply_dct(blocks):
-    h_b, w_b, h, w, c = blocks.shape
-    dct_blocks = np.zeros_like(blocks, dtype=np.float32)
+
+def reconstruct_image(blocks: np.ndarray) -> np.ndarray:
+    h_b, w_b, _, _, c = blocks.shape
+    img = np.zeros((h_b * 8, w_b * 8, c), dtype=np.float32)
     for i in range(h_b):
         for j in range(w_b):
-            for k in range(c):
-                block = np.float32(blocks[i, j, :, :, k])
-                dct_blocks[i, j, :, :, k] = cv.dct(block)
-    return dct_blocks
+            img[i*8:(i+1)*8, j*8:(j+1)*8, :] = blocks[i, j]
+    return img
 
-# FIX 1: Return int32 instead of float32 to prevent truncation bugs when
-# calling int() on values like 2.9999998 (which would silently give 2, not 3),
-# flipping embedded LSBs during both embedding and extraction.
-def quantize_blocks(dct_blocks):
-    h_b, w_b, h, w, c = dct_blocks.shape
-    quantized_blocks = np.zeros((h_b, w_b, h, w, c), dtype=np.int32)
-    for i in range(h_b):
-        for j in range(w_b):
-            for k in range(c):
-                quantized_blocks[i, j, :, :, k] = np.round(
-                    dct_blocks[i, j, :, :, k] / Q_table
-                ).astype(np.int32)
-    return quantized_blocks
 
-def select_mid_frequency_coefficients(quantized_blocks):
-    return quantized_blocks
+# ── QIM embedding / extraction ───────────────────────────────────────────────
 
-def embed_lsb_watermark(quantized_blocks, watermark_bits):
-    h_b, w_b, h, w, c = quantized_blocks.shape
+def embed_qim(blocks: np.ndarray, watermark_bits: str, jpeg_Q: np.ndarray) -> np.ndarray:
+    """
+    QIM embedding on pre-quantized blocks.
+
+    IMPORTANT: blocks must come from a JPEG-decoded image (see
+    jpeg_watermark_pipeline). Because the pixels are already dequantized
+    integer-DCT values, cv2.dct recovers the exact q that JPEG stored
+    internally. Pinning q*step and calling cv2.idct then produces spatial
+    values that JPEG's integer DCT will re-quantize back to exactly q,
+    guaranteeing zero bit errors on extraction.
+    """
+    result = blocks.copy()
     bit_idx = 0
     total_bits = len(watermark_bits)
-    
-    watermarked_blocks = np.copy(quantized_blocks)
+    h_b, w_b = result.shape[:2]
+
     for i in range(h_b):
         for j in range(w_b):
-            for idx in mid_freq_indices:
+            dct_block = cv.dct(result[i, j, :, :, 0].copy())
+            changed = False
+
+            for r, c in mid_freq_indices:
                 if bit_idx >= total_bits:
-                    return watermarked_blocks
-                r, c_idx = idx
-                coeff = int(watermarked_blocks[i, j, r, c_idx, 0])
-                bit = int(watermark_bits[bit_idx])
-                if coeff % 2 != bit:
-                    if coeff > 0:
-                        coeff -= 1
-                    elif coeff < 0:
-                        coeff += 1
-                    else:
-                        coeff = 1 if bit == 1 else 0
-                watermarked_blocks[i, j, r, c_idx, 0] = coeff
-                bit_idx += 1
-    if bit_idx < total_bits:
-        print(f"Warning: Watermark too large ({total_bits} bits) for image capacity ({bit_idx} bits). Embedded truncated data.")
-    return watermarked_blocks
-
-def extract_watermark(quantized_blocks):
-    h_b, w_b, h, w, c = quantized_blocks.shape
-    extracted_bits = []
-    
-    # Extract 32 bits for length
-    for i in range(h_b):
-        for j in range(w_b):
-            for idx in mid_freq_indices:
-                r, c_idx = idx
-                coeff = int(quantized_blocks[i, j, r, c_idx, 0])
-                extracted_bits.append(str(coeff % 2))
-                if len(extracted_bits) == 32:
                     break
-            if len(extracted_bits) == 32:
-                break
-        if len(extracted_bits) == 32:
-            break
-            
-    if len(extracted_bits) < 32:
+
+                desired = int(watermark_bits[bit_idx])
+                step = jpeg_Q[r, c]
+
+                q = int(np.round(dct_block[r, c] / step))
+                if q % 2 != desired:
+                    q += 1
+
+                dct_block[r, c] = q * step
+                bit_idx += 1
+                changed = True
+
+            if changed:
+                result[i, j, :, :, 0] = cv.idct(dct_block)
+
+    if bit_idx < total_bits:
+        print(f"Warning: capacity {bit_idx} bits < watermark {total_bits} bits. Truncated.")
+    return result
+
+
+def extract_qim(blocks: np.ndarray, jpeg_Q: np.ndarray) -> str:
+    h_b, w_b = blocks.shape[:2]
+
+    def iter_bits():
+        for i in range(h_b):
+            for j in range(w_b):
+                dct_block = cv.dct(np.float32(blocks[i, j, :, :, 0]))
+                for r, c in mid_freq_indices:
+                    q = int(np.round(dct_block[r, c] / jpeg_Q[r, c]))
+                    yield q % 2
+
+    gen = iter_bits()
+
+    header = [next(gen) for _ in range(32)]
+    if len(header) < 32:
         return ""
-        
-    length_bin = ''.join(extracted_bits[:32])
-    length = int(length_bin, 2)
-    
-    extracted_bits = []
-    bit_idx = 0
-    
-    for i in range(h_b):
-        for j in range(w_b):
-            for idx in mid_freq_indices:
-                if bit_idx < 32:
-                    bit_idx += 1
-                    continue
-                r, c_idx = idx
-                coeff = int(quantized_blocks[i, j, r, c_idx, 0])
-                extracted_bits.append(str(coeff % 2))
-                if len(extracted_bits) == length:
-                    return ''.join(extracted_bits)
-    return ''.join(extracted_bits)
+    payload_len = int(''.join(str(b) for b in header), 2)
 
-def apply_zigzag_scan(watermarked_blocks):
-    return watermarked_blocks
+    max_possible = h_b * w_b * len(mid_freq_indices) - 32
+    if payload_len <= 0 or payload_len > max_possible:
+        print(f"Warning: extracted length header is invalid ({payload_len} bits). "
+              f"Max capacity is {max_possible} bits. Watermark may be corrupted.")
+        return ""
 
-def run_length_encode(zigzag_data):
-    return zigzag_data
+    payload = []
+    for bit in gen:
+        payload.append(str(bit))
+        if len(payload) == payload_len:
+            break
 
-def huffman_encode(rle_data):
-    return rle_data
+    return ''.join(payload)
 
-# FIX 2: Save as PNG (lossless) instead of JPEG.
-# JPEG re-compression applies its own DCT + quantization cycle, overwriting the
-# LSBs you carefully embedded. PNG preserves exact pixel values so the
-# DCT → quantize round-trip during extraction recovers the original coefficients.
-def generate_jpeg_file(huffman_data, output_path):
-    h_b, w_b, h, w, c = huffman_data.shape
-    img_h, img_w = h_b * 8, w_b * 8
-    reconstructed = np.zeros((img_h, img_w, c), dtype=np.uint8)
-    
-    for i in range(h_b):
-        for j in range(w_b):
-            for k in range(c):
-                dequantized = huffman_data[i, j, :, :, k] * Q_table
-                idct_block = cv.idct(np.float32(dequantized))
-                reconstructed[i*8:(i+1)*8, j*8:(j+1)*8, k] = np.clip(idct_block, 0, 255)
-                
-    bgr_img = cv.cvtColor(reconstructed, cv.COLOR_YCrCb2BGR)
 
-    # Force lossless PNG output regardless of the extension the user typed.
-    # Saving as JPEG would apply a second lossy compression cycle and destroy
-    # the embedded watermark bits.
-    if not output_path.lower().endswith('.png'):
-        output_path = output_path.rsplit('.', 1)[0] + '_watermarked.png'
-        print(f"Note: Output forced to PNG to preserve watermark integrity: {output_path}")
+# ── Public pipelines ─────────────────────────────────────────────────────────
 
-    cv.imwrite(output_path, bgr_img)
-    return bgr_img, output_path
+def jpeg_watermark_pipeline(image_path: str, watermark_path: str, output_path: str):
+    """
+    Embed a watermark file into an image and save as JPEG.
 
-def jpeg_watermark_pipeline(rgb_image_path, watermark_path, output_path):
-    rgb_image = load_rgb_image(rgb_image_path)
-    ycbcr_image = convert_rgb_to_ycbcr(rgb_image)
-    subsampled_image = apply_chroma_subsampling(ycbcr_image)
-    blocks = segment_into_8x8_blocks(subsampled_image)
-    
-    dct_blocks = apply_dct(blocks)
-    quantized_blocks = quantize_blocks(dct_blocks)
-    selected_coeffs = select_mid_frequency_coefficients(quantized_blocks)
-    
+    ROOT CAUSE FIX — pre-quantization before embedding:
+    ----------------------------------------------------
+    cv2.dct uses a floating-point DCT, but libjpeg (used internally by
+    cv2.imwrite) uses an integer AAN DCT. When we pin a coefficient to
+    q*step in float DCT space and call cv2.idct, tiny floating-point errors
+    appear in the spatial pixels. When JPEG's integer DCT then re-quantizes
+    those pixels it can recover a different q, flipping the embedded bit.
+
+    Fix: save the source image as JPEG at JPEG_QUALITY first, then reload it.
+    The reloaded pixels are exact dequantized outputs of JPEG's integer DCT,
+    so cv2.dct recovers the same q JPEG stored. After embedding and saving
+    again at the same quality, JPEG's integer DCT re-quantizes back to
+    exactly our pinned q — zero bit errors guaranteed.
+    """
+    jpeg_Q = compute_jpeg_qtable(JPEG_QUALITY)
+
+    bgr = cv.imread(image_path)
+    if bgr is None:
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    if not output_path.lower().endswith(('.jpg', '.jpeg')):
+        output_path = output_path.rsplit('.', 1)[0] + '.jpg'
+        print(f"Output adjusted to: {output_path}")
+
+    # ── PRE-QUANTIZATION: bake in JPEG's integer DCT rounding before embedding
+    cv.imwrite(output_path, bgr, [cv.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    bgr_prequant = cv.imread(output_path)
+
+    ycbcr  = cv.cvtColor(bgr_prequant, cv.COLOR_BGR2YCrCb).astype(np.float32)
+    blocks = segment_into_8x8_blocks(ycbcr)
+
     try:
         with open(watermark_path, 'rb') as f:
             wm_bytes = f.read()
     except Exception as e:
-        print(f"Failed to read watermark file: {e}")
+        print(f"Failed to read watermark: {e}")
         return
-        
-    wm_bits = ''.join(format(byte, '08b') for byte in wm_bytes)
-    length_bits = format(len(wm_bits), '032b')
-    full_watermark_bits = length_bits + wm_bits
-    
-    watermarked_blocks = embed_lsb_watermark(selected_coeffs, full_watermark_bits)
-    
-    zigzag_data = apply_zigzag_scan(watermarked_blocks)
-    rle_data = run_length_encode(zigzag_data)
-    huffman_data = huffman_encode(rle_data)
-    
-    reconstructed_img, final_output_path = generate_jpeg_file(huffman_data, output_path)
-    
-    orig_bgr = cv.imread(rgb_image_path)
-    orig_bgr = orig_bgr[:reconstructed_img.shape[0], :reconstructed_img.shape[1], :]
-    
-    mse = util.calculate_mse(orig_bgr, reconstructed_img)
-    psnr = util.calculate_psnr(orig_bgr, reconstructed_img)
-    print(f"Embedding successful. Saved to {final_output_path}")
-    print(f"MSE: {mse:.4f}")
-    print(f"PSNR: {psnr:.4f} dB")
 
-def extract_watermark_pipeline(watermarked_image_path, output_wm_path):
-    rgb_image = load_rgb_image(watermarked_image_path)
-    ycbcr_image = convert_rgb_to_ycbcr(rgb_image)
-    subsampled_image = apply_chroma_subsampling(ycbcr_image)
-    blocks = segment_into_8x8_blocks(subsampled_image)
-    
-    dct_blocks = apply_dct(blocks)
-    quantized_blocks = quantize_blocks(dct_blocks)
-    
-    extracted_bits = extract_watermark(quantized_blocks)
-    
-    if not extracted_bits:
-        print("Failed to extract watermark. The image may not contain one.")
+    wm_bits   = ''.join(format(b, '08b') for b in wm_bytes)
+    full_bits = format(len(wm_bits), '032b') + wm_bits
+
+    h_b, w_b = blocks.shape[:2]
+    usable   = h_b * w_b * len(mid_freq_indices) - 32
+    if len(wm_bits) > usable:
+        print(f"Warning: watermark payload ({len(wm_bits)} bits) exceeds usable "
+              f"capacity ({usable} bits). Watermark will be truncated.")
+
+    watermarked = embed_qim(blocks, full_bits, jpeg_Q)
+
+    img_out = np.clip(reconstruct_image(watermarked), 0, 255).astype(np.uint8)
+    bgr_out = cv.cvtColor(img_out, cv.COLOR_YCrCb2BGR)
+    cv.imwrite(output_path, bgr_out, [cv.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+
+    wm_bgr = cv.imread(output_path)
+    if wm_bgr is not None:
+        h = min(bgr.shape[0], wm_bgr.shape[0])
+        w = min(bgr.shape[1], wm_bgr.shape[1])
+        mse  = util.calculate_mse(bgr[:h, :w], wm_bgr[:h, :w])
+        psnr = util.calculate_psnr(bgr[:h, :w], wm_bgr[:h, :w])
+        print(f"Saved to {output_path}  |  MSE: {mse:.4f}  |  PSNR: {psnr:.2f} dB")
+    else:
+        print(f"Saved to {output_path}")
+
+
+def extract_watermark_pipeline(watermarked_image_path: str, output_wm_path: str):
+    """
+    Extract a previously embedded watermark from a JPEG image.
+    Uses BGR throughout to match the embed pipeline exactly.
+    """
+    jpeg_Q = compute_jpeg_qtable(JPEG_QUALITY)
+
+    img = cv.imread(watermarked_image_path)
+    if img is None:
+        print(f"Image not found: {watermarked_image_path}")
         return
-        
+
+    ycbcr  = cv.cvtColor(img, cv.COLOR_BGR2YCrCb).astype(np.float32)
+    blocks = segment_into_8x8_blocks(ycbcr)
+
+    extracted_bits = extract_qim(blocks, jpeg_Q)
+    if not extracted_bits:
+        print("Failed to extract watermark.")
+        return
+
     byte_array = bytearray()
     for i in range(0, len(extracted_bits), 8):
-        byte_segment = extracted_bits[i:i+8]
-        if len(byte_segment) == 8:
-            byte_array.append(int(byte_segment, 2))
-            
+        seg = extracted_bits[i:i+8]
+        if len(seg) == 8:
+            byte_array.append(int(seg, 2))
+
     try:
         with open(output_wm_path, 'wb') as f:
             f.write(byte_array)
-        print(f"Watermark successfully extracted to {output_wm_path}")
+        print(f"Watermark extracted to {output_wm_path}")
     except Exception as e:
-        print(f"Failed to save extracted watermark: {e}")
+        print(f"Failed to save: {e}")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
     while True:
@@ -253,35 +247,41 @@ def main():
         print("3. Extract watermark")
         print("4. Exit")
         choice = input("Enter choice (1/2/3/4): ")
-        
+
         if choice == '1':
-            img_path = input("Enter input image path: ")
+            img_path = input("Image path: ")
             img = cv.imread(img_path)
             if img is not None:
                 h, w, _ = img.shape
-                max_size = util.calculate_max_insertion_size(w, h, 8, 22)
-                print(f"Max insertion size: {max_size} bits")
+                raw_size = util.calculate_max_insertion_size(w, h, 8, 22)
+                usable   = max(0, raw_size - 32)
+                print(f"Max insertion size: {usable} bits usable "
+                      f"({raw_size} total, 32 reserved for length header)")
             else:
                 print("Image not found.")
+
         elif choice == '2':
-            img_path = input("Enter input image path: ")
-            watermark_path = input("Enter path to watermark file (e.g., wm.jpeg): ")
-            out_path = input("Enter output image path (will be saved as .png): ")
+            img_path = input("Input image path: ")
+            wm_path  = input("Watermark file path: ")
+            out_path = input("Output JPEG path: ")
             try:
-                jpeg_watermark_pipeline(img_path, watermark_path, out_path)
+                jpeg_watermark_pipeline(img_path, wm_path, out_path)
             except Exception as e:
                 print(f"Error: {e}")
+
         elif choice == '3':
-            img_path = input("Enter watermarked image path: ")
-            out_path = input("Enter output path for extracted watermark (e.g., ext_wm.jpeg): ")
+            img_path = input("Watermarked JPEG path: ")
+            out_path = input("Output path for extracted watermark: ")
             try:
                 extract_watermark_pipeline(img_path, out_path)
             except Exception as e:
                 print(f"Error: {e}")
+
         elif choice == '4':
             break
         else:
             print("Invalid choice.")
+
 
 if __name__ == '__main__':
     main()

@@ -7,11 +7,11 @@ import math
 # ==========================================
 def findpoint(df, r):
     """
-    Finds a sequence of coordinates in an 8x8 block using a zig-zag diagonal path.
-    This helps target mid-frequency coefficients for embedding.
+    Finds a sequence of coordinates in an 8x8 block using a zig-zag diagonal path
+    to locate mid-frequency coefficients for embedding.
     """
     maxrow, maxcol = 8, 8
-    # dire=-1 means up-right, dire=1 means down-left
+    # dire=-1 up-right, dire=1 down-left
     di = {-1: (-1, 1), 1: (1, -1)}
     xydict = {}
     while(r):	
@@ -43,22 +43,24 @@ def fpg(bsrc):
     for i in range(bsrc.shape[0]):
         for j in range(bsrc.shape[1]):
             yield (i, j)
-    # Yield (-1, -1) continuously to prevent StopIteration errors when done
+    # Yield (-1, -1) continuously to prevent StopIteration errors
     while True:
         yield (-1, -1)
 
 # ==========================================
 # Functions originally from embed.py
 # ==========================================
-def embed(srcs):
-    # Read square watermark image (fingerprint) and invert it
-    src = cv.imread(srcs)    
+def embed(watermark_path, host_path):
+    # Read square watermark image (fingerprint) and invert colors
+    src = cv.imread(watermark_path)
+    if src is None:
+        raise FileNotFoundError(f"Could not read watermark image at {watermark_path}")
     src = cv.bitwise_not(src)  
     
     # Convert to grayscale
     graysrc = cv.cvtColor(src, cv.COLOR_BGR2GRAY)  
     
-    # Apply median filtering
+    # Apply median filtering to reduce noise
     medianblurimg = cv.medianBlur(graysrc, 3)
     
     # Binarization: values < 70 become 255 (white), > 70 become 0 (black)
@@ -67,34 +69,38 @@ def embed(srcs):
     cv.imwrite('embedfinger.jpg', bsrc, [int(cv.IMWRITE_JPEG_QUALITY), 100])
 
     # Read host image
-    host = cv.imread('host.jpg')  
-    # Convert host to YUV (we will embed in the Y channel)
+    host = cv.imread(host_path)
+    if host is None:
+        raise FileNotFoundError(f"Could not read host image at {host_path}")
+    
+    # Convert host to YUV color space (embedding will be in the Y channel)
     hostyuv = cv.cvtColor(host, cv.COLOR_RGB2YUV)  
     # Convert to float32, which is required for DCT
     hostf = hostyuv.astype('float32')
 
-    # Target finish image
+    # Target output image
     finishwm = hostf
     
-    # Create visualization for 8x8 blocks
+    # Create a matrix for observing 8x8 blocks
     wmblocks = np.zeros([hostf.shape[0], hostf.shape[1], 3], np.float32)
     wmblocks[:,:,:] = hostf[:,:,:]
     
-    # Calculate row/col counts for 8x8 blocks
+    # Calculate the number of rows and columns for 8x8 blocks
     part8x8rownum = int(host.shape[0]/8)
     part8x8colnum = int(host.shape[1]/8)
     
-    # Total pixels in the fingerprint
-    fingernum = bsrc.shape[0] * bsrc.shape[1]
+    # Extract dimensions of the watermark to pass to the extractor later
+    wm_height, wm_width = bsrc.shape[0], bsrc.shape[1]
+    total_pixels = wm_height * wm_width
     
-    # Calculate average number of fingerprint pixels to store per 8x8 block
-    r = math.ceil(fingernum / (part8x8rownum * part8x8colnum))
-    print("r=", r)
+    # Calculate the average number of fingerprint pixels to store per 8x8 block
+    r = math.ceil(total_pixels / (part8x8rownum * part8x8colnum))
+    print(f"r = {r} (bits per 8x8 block)")
     
     # Find grid coordinates to use within each 8x8 block
     xydict = findpoint((3, 4, -1), r)
     
-    # Generator for fingerprint pixels
+    # Fingerprint pixel generator
     fpgij = fpg(bsrc)
     
     count = 0
@@ -122,7 +128,7 @@ def embed(srcs):
                 
                 rx, ry = xydict[t]
                 
-                # Relational embedding: adjust r1 and r2 (symmetric pairs)
+                # Relational embedding: adjust r1 and r2 (symmetric pair)
                 r1 = part8x8[rx, ry]
                 r2 = part8x8[7-rx, 7-ry] 
                 
@@ -139,16 +145,16 @@ def embed(srcs):
                 if not flag:
                     count += 1
                     
-            # Inverse DCT
+            # Inverse DCT (IDCT)
             finishwm[8*parti:8*parti+8, 8*partj:8*partj+8, 0] = cv.idct(part8x8)
             wmblocks[8*parti:8*parti+8, 8*partj:8*partj+8, 0] = finishwm[8*parti:8*parti+8, 8*partj:8*partj+8, 0]
             
-            # Draw block lines for visualizer
+            # Draw block lines for the visualizer
             if (wmblocks.shape[0] > 8*parti+7) and (wmblocks.shape[1] > 8*partj+7):
                 wmblocks[8*parti:8*parti+8, 8*partj+7, 0] = 100
                 wmblocks[8*parti+7, 8*partj:8*partj+8, 0] = 100
                 
-    # Reconvert to RGB space
+    # Reconvert back to RGB color space
     wmrgb = cv.cvtColor(finishwm.astype('uint8'), cv.COLOR_YUV2RGB) 	
     
     cv.imshow('wmblocks', cv.cvtColor(wmblocks.astype('uint8'), cv.COLOR_YUV2RGB))
@@ -156,24 +162,85 @@ def embed(srcs):
     cv.destroyAllWindows()	
     
     # Save at different JPEG quality levels
-    for x in range(6):
-        name = "finishwm" + str(x)
-        filename = name + ".jpg"
-        cv.imwrite(filename, wmrgb, [int(cv.IMWRITE_JPEG_QUALITY), 100-x])
+    cv.imwrite("finishwm.jpg", wmrgb, [int(cv.IMWRITE_JPEG_QUALITY), 100])
+
+    print("countembed =", count)
+    
+    # Return extraction parameters
+    return r, wm_height, wm_width
+
+# ==========================================
+# Functions originally from extract.py
+# ==========================================
+def extract(src, dst, r, wm_height, wm_width):
+    wmrgb = cv.imread(src)
+    if wmrgb is None:
+        raise FileNotFoundError(f"Could not read watermarked image at {src}")
         
-        img = cv.imread(filename)
-        cv.namedWindow(name, 0)	
-        k = 480
-        cv.resizeWindow(name, k, int(k * img.shape[0] / img.shape[1]))
-        cv.imshow(name, img)
+    wmyuv = cv.cvtColor(wmrgb, cv.COLOR_RGB2YUV) 
+    wmf = wmyuv.astype('float32')
+    part8x8rownum = int(wmf.shape[0] / 8)
+    part8x8colnum = int(wmf.shape[1] / 8)
+    
+    extractxydict = findpoint((3, 4, -1), r)
+    
+    # Maximum empty carrier for restored watermark matching original dimensions
+    finishfinger = np.zeros([wm_height, wm_width, 3], np.uint8)
+    i, j = 0, 0
+    count = 0
+    
+    for parti in range(part8x8rownum):
+        for partj in range(part8x8colnum):
+            # Ignore blocks smaller than 8x8
+            part8x8 = cv.dct(wmf[8*parti:8*parti+8, 8*partj:8*partj+8, 0])
+            if (part8x8.shape[0] < 8) or (part8x8.shape[1] < 8):
+                continue
+            
+            # Each 8x8 DCT block stores r fingerprint pixels
+            for t in range(r):
+                if i == wm_height:
+                    break
+                
+                # The grid coordinates where the fingerprint pixel should be
+                rx, ry = extractxydict[t]
+                
+                # Observe the relationship between r1 and r2 to determine if the pixel is black or white
+                r1 = part8x8[rx, ry]
+                r2 = part8x8[7-rx, 7-ry] # Centrally symmetric grid cell to r1
+                
+                if r1 > r2:
+                    finishfinger[i, j] = 0 # Black
+                elif r1 < r2:
+                    finishfinger[i, j] = 255 # White
+                    
+                j += 1
+                if j == wm_width:
+                    j = 0
+                    i += 1
+                count += 1
+                
+    print(f"countextract ({dst}) =", count)
+    cv.imwrite(dst, finishfinger, [int(cv.IMWRITE_JPEG_QUALITY), 100])
 
-    print("countembed=", count)
-
+# ==========================================
+# Main Execution
+# ==========================================
 def main():
+    print("--- Image Watermarking Tool ---")
+    host_path = input("Enter the path for the host image (e.g., 'host.jpg'): ").strip()
+    wm_path = input("Enter the path for the watermark image (e.g., 'fingerprint.jpg'): ").strip()
+
+    print("\n--- Starting Embedding Process ---")
     try:
-        embed('fingerprint.jpg')
+        r, wm_height, wm_width = embed(wm_path, host_path)
     except Exception as e:
-        print(f"Error reading image: {e}")
+        print(f"Error during embedding: {e}")
+        return
+
+    print("\n--- Starting Extraction Process ---")
+    extract("finishwm.jpg", "extractfinger.jpg", r, wm_height, wm_width)
+
+    print("\nProcesses complete. Press any key on an image window to exit.")
     cv.waitKey(0)  
     cv.destroyAllWindows()
 
