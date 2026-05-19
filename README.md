@@ -67,7 +67,6 @@ This will launch a prompt allowing you to calculate capacity, embed, and extract
 ## Project Structure
 
 - `QIM_embed.py`: Advanced CLI tool for QIM embedding, extraction, and attacks.
-- `watermark.py`: Interactive, menu-driven script.
 - `batch_embed.py`: Automation script for testing robustness across different quality factors.
 - `utils.py`: Utility functions for BER, MSE, PSNR, and capacity calculations.
 - `jpeg_encoder.py`: An experimental, pure-Python manual JPEG encoder that writes raw quantized DCT blocks directly to the bitstream.
