@@ -62,6 +62,8 @@ Anda dapat menjalankan pengetesan otomasi untuk semua tingkat kualitas menggunak
 python batch_embed.py
 ```
 
+## 3. Hasil Pengetesan
+
 ### 3.1 Hasil Kuantitatif (BER & PSNR)
 | QF | MSE | PSNR (dB) | Bit Errors | BER (%) |
 | :--- | :--- | :--- | :--- | :--- |
@@ -71,21 +73,31 @@ python batch_embed.py
 | **30** | 10.1850 | 38.05 | 918 | 4.08 |
 | **10** | 67.5706 | 29.83 | 918 | 4.08 |
 
-### 3.3 Visualisasi Langkah-langkah (Notebook)
-
+### 3.2 Visualisasi Langkah-langkah (Notebook)
 Anda dapat memvisualisasikan langkah-langkah penyisipan watermark secara mendalam menggunakan notebook `QIM_Visualization.ipynb`. Berikut adalah visualisasi setiap tahapannya:
 
-#### Step 1: Membaca Citra Host dan Watermark
+**Step 1: Membaca Citra Host dan Watermark**
 Proses awal dimulai dengan memuat gambar asli (host) dan gambar watermark yang akan disisipkan.
 ![Input Gambar](docs/notebook_images/step_0.png)
 
-#### Step 2: Konversi Warna ke YCbCr
+**Step 2: Konversi Warna ke YCbCr**
 Gambar dikonversi ke ruang warna YCbCr untuk memisahkan komponen luminansi (Y) dari komponen warna (Cb, Cr). Penyisipan watermark dilakukan pada kanal Y karena mata manusia lebih peka terhadap perubahan intensitas cahaya (luminansi).
 ![Kanal Luminansi](docs/notebook_images/step_1.png)
 
-#### Step 3: DCT, QIM, dan Rekonstruksi
+**Step 3: DCT, QIM, dan Rekonstruksi**
 Pada tahap ini, dilakukan transformasi DCT pada blok 8x8, penyisipan bit watermark melalui modulasi QIM pada koefisien tertentu, dan rekonstruksi kembali menjadi citra. Hasilnya, perbedaan antara blok asli dan blok yang sudah disisipi watermark tidak terlihat oleh mata manusia.
 ![Rekonstruksi Blok](docs/notebook_images/step_2.png)
+
+**Step 4: Hasil Pemulihan Watermark**
+Berikut adalah hasil ekstraksi watermark pada berbagai *Quality Factor* (QF). Semakin rendah nilai BER, semakin baik kualitas watermark yang berhasil dipulihkan.
+
+| QF | Gambar Watermark | PSNR (dB) | Bit Errors | BER (%) |
+| :--- | :--- | :--- | :--- | :--- |
+| **90** | ![QF 90](watermark_recovered/recovered_qf90.jpg) | 49.69 | 926 | 4.12 |
+| **70** | ![QF 70](watermark_recovered/recovered_qf70.jpg) | 44.82 | 918 | 4.08 |
+| **50** | ![QF 50](watermark_recovered/recovered_qf50.jpg) | 40.78 | 918 | 4.08 |
+| **30** | ![QF 30](watermark_recovered/recovered_qf30.jpg) | 38.05 | 918 | 4.08 |
+| **10** | ![QF 10](watermark_recovered/recovered_qf10.jpg) | 29.83 | 918 | 4.08 |
 
 ---
 
